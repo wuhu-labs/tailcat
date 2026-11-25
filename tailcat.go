@@ -391,7 +391,10 @@ type locoBackend struct {
 	mu           sync.Mutex
 	clients      map[key.NodePublic]*tailcfg.Node // for the server
 	nextClientID tailcfg.NodeID                   // for the server; never reused after a removal
-	pendingAllow map[key.NodePublic]bool          // client keys with an allowClient call in flight
+	pendingAllow map[key.NodePublic]chan struct{} // closed when an admission decision has been applied
+	meowWaiters  map[key.NodePublic]map[chan key.DiscoPublic]struct{}
+	serverCtx    context.Context // canceled at Close (server only)
+	stopServer   context.CancelFunc
 	nm           *netmap.NetworkMap
 	eps          []netip.AddrPort // our current local UDP endpoints, sorted
 	closeOnce    sync.Once
@@ -409,6 +412,11 @@ func (b *locoBackend) derpRegionID() tailcfg.DERPRegionID {
 
 func (b *locoBackend) Close() error {
 	b.closeOnce.Do(func() {
+		if b.stopServer != nil {
+			b.mu.Lock()
+			b.stopServer()
+			b.mu.Unlock()
+		}
 		if b.ns != nil {
 			b.ns.Close()
 		}
@@ -707,12 +715,14 @@ func (s *Server) startLocked(ctx context.Context) error {
 	sys.Set(store)
 
 	lb.isServer = true
+	lb.serverCtx, lb.stopServer = context.WithCancel(context.Background())
 	lb.onDERPRecv = func(regionID tailcfg.DERPRegionID, src key.NodePublic, pkt []byte) bool {
 		if !IsMeowPacket(pkt) {
 			return false
 		}
 		if IsMeowedPacket(pkt) {
-			return true // server ignores meowed
+			lb.onMeowed(src, pkt)
+			return true
 		}
 		if _, discoPub, ok := ParseMeowPing(pkt); ok {
 			mc := lb.sys.MagicSock.Get()
@@ -720,8 +730,8 @@ func (s *Server) startLocked(ctx context.Context) error {
 				// Only reply once the client is fully added as a peer:
 				// "meowed" is the ack that tells the client it can
 				// start dialing. Disallowed clients get no reply.
-				if lb.onMeow(src, discoPub) {
-					mc.SendDERPPacketTo(src, regionID, EncodeMeowed())
+				if lb.registerPeer(nil, src, discoPub) {
+					mc.SendDERPPacketTo(src, regionID, lb.discoPublic().AppendTo(EncodeMeowed()))
 				}
 			}()
 			return true
@@ -1810,33 +1820,40 @@ func (lb *locoBackend) Start() error {
 	return nil
 }
 
-// onMeow handles a MeowPing from the client with node key src and
-// disco key discoPub, adding it as a WireGuard peer. It reports
-// whether the client is allowed and configured, meaning a "meowed"
-// acknowledgment may be sent.
-func (b *locoBackend) onMeow(src key.NodePublic, discoPub key.DiscoPublic) bool {
-	b.logf("got meow from %v", src.String())
+// registerPeer installs a peer learned through a meow or its reply.
+// With a nil ctx (an incoming meow), a concurrent admission check
+// causes this packet to be dropped; the sender will retransmit it.
+func (b *locoBackend) registerPeer(ctx context.Context, src key.NodePublic, discoPub key.DiscoPublic) bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.serverCtx.Err() != nil || src == b.pub || src.IsZero() {
+		return false
+	}
 	if _, ok := b.clients[src]; ok {
 		return true
 	}
 	if b.allowClient != nil {
-		if b.pendingAllow[src] {
-			// An earlier meow from src is still waiting on the
-			// hook. Drop this one; src retries once a second.
-			return false
+		if pending := b.pendingAllow[src]; pending != nil {
+			if ctx == nil {
+				return false
+			}
+			b.mu.Unlock()
+			select {
+			case <-ctx.Done():
+			case <-pending:
+			}
+			b.mu.Lock()
+			return b.clients[src] != nil
 		}
-		// Ask the hook with b.mu released: it may block, and it may
-		// call Server methods that take b.mu. pendingAllow keeps a
-		// second meow from src from racing us to add the client.
-		mak.Set(&b.pendingAllow, src, true)
+		// The hook may block and call methods that take b.mu.
+		pending := make(chan struct{})
+		mak.Set(&b.pendingAllow, src, pending)
+		defer close(pending)
 		b.mu.Unlock()
 		allowed := b.allowClient(src)
 		b.mu.Lock()
 		delete(b.pendingAllow, src)
-		if !allowed {
-			b.logf("ignoring meow from %v: rejected by AllowClient", src.String())
+		if !allowed || b.serverCtx.Err() != nil {
 			return false
 		}
 	}

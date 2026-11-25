@@ -174,3 +174,14 @@ func TestMeowMagicDistinct(t *testing.T) {
 		t.Error("meow magic collides with disco magic")
 	}
 }
+
+func TestMeowedDiscoKey(t *testing.T) {
+	want := key.NewDisco().Public()
+	pkt := want.AppendTo(EncodeMeowed())
+	if got := meowedDiscoKey(pkt); got != want {
+		t.Errorf("meowed disco key = %v; want %v", got, want)
+	}
+	if got := meowedDiscoKey(EncodeMeowed()); !got.IsZero() {
+		t.Errorf("legacy meowed disco key = %v; want zero", got)
+	}
+}

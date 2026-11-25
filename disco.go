@@ -68,3 +68,12 @@ func ParseMeowPing(pkt []byte) (nodeKey key.NodePublic, discoKey key.DiscoPublic
 func IsMeowedPacket(pkt []byte) bool {
 	return len(pkt) >= 5 && [4]byte(pkt[:4]) == meowMagic && pkt[4] == meowTypePong
 }
+
+// meowedDiscoKey extracts the optional path-discovery key from a packet
+// already recognized by IsMeowedPacket. Older peers send only the header.
+func meowedDiscoKey(pkt []byte) key.DiscoPublic {
+	if len(pkt) < 5+key.DiscoPublicRawLen {
+		return key.DiscoPublic{}
+	}
+	return key.DiscoPublicFromRaw32(mem.B(pkt[5 : 5+key.DiscoPublicRawLen]))
+}
