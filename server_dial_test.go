@@ -5,6 +5,7 @@ package tailcat
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"os"
@@ -12,7 +13,11 @@ import (
 	"testing"
 	"time"
 
+	"tailscale.com/derp"
+	"tailscale.com/derp/derphttp"
 	"tailscale.com/envknob"
+	"tailscale.com/net/netmon"
+	"tailscale.com/tailcfg"
 	"tailscale.com/tstest/integration"
 	"tailscale.com/types/key"
 )
@@ -21,7 +26,7 @@ func TestServerDial(t *testing.T) {
 	old := os.Getenv("TS_DEBUG_NEVER_DIRECT_UDP")
 	envknob.Setenv("TS_DEBUG_NEVER_DIRECT_UDP", "true")
 	t.Cleanup(func() { envknob.Setenv("TS_DEBUG_NEVER_DIRECT_UDP", old) })
-	ctx, cancel := context.WithTimeout(t.Context(), 25*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 35*time.Second)
 	defer cancel()
 	region := integration.RunDERPAndSTUN(t, mkLogger(t, "derp"), "127.0.0.1").Regions[1]
 	aKey, bKey := key.NewNode(), key.NewNode()
@@ -84,4 +89,93 @@ func TestServerDial(t *testing.T) {
 	b.Close()
 	b, lb = listen(bKey, &bAdmitted)
 	check(dial(a, bKey.Public()), b, lb, aKey.Public())
+
+	// A still knows B's key. This time B restarts with a policy that
+	// refuses A. The new B cannot answer the first TCP SYN, and its
+	// admission hook witnesses the retried meow before Dial fails.
+	b.Close()
+	meows := make(chan key.NodePublic, 1)
+	b = &Server{
+		Key: bKey, Region: region, DisablePresharedKey: true, Logf: mkLogger(t, "refusing peer"),
+		AllowClient: func(peer key.NodePublic) bool {
+			select {
+			case meows <- peer:
+			default:
+			}
+			return false
+		},
+	}
+	t.Cleanup(func() { b.Close() })
+	if err := b.StartContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	dialCtx, stop := context.WithTimeout(ctx, 7*time.Second)
+	defer stop()
+	c, err := a.Dial(dialCtx, bKey.Public(), 80)
+	if c != nil {
+		c.Close()
+	}
+	if c != nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Dial after rejected refresh = %v, %v; want no stream and deadline exceeded", c, err)
+	}
+	select {
+	case peer := <-meows:
+		if peer != aKey.Public() {
+			t.Fatalf("retried meow from %v; want %v", peer, aKey.Public())
+		}
+	default:
+		t.Fatal("Dial did not retry the meow handshake with the restarted peer")
+	}
+}
+
+func TestServerDialRejectsLegacyMeowed(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	region := integration.RunDERPAndSTUN(t, mkLogger(t, "derp"), "127.0.0.1").Regions[1]
+	aKey, bKey := key.NewNode(), key.NewNode()
+	a := &Server{Key: aKey, Region: region, DisablePresharedKey: true, Logf: mkLogger(t, "dialer")}
+	t.Cleanup(func() { a.Close() })
+	if err := a.StartContext(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A peer speaking the old meow wire format sends a header-only
+	// acknowledgement from its own authenticated DERP connection.
+	b := derphttp.NewRegionClient(bKey, mkLogger(t, "legacy peer"), netmon.NewStatic(), func() *tailcfg.DERPRegion { return region })
+	defer b.Close()
+	if err := b.Connect(ctx); err != nil {
+		t.Fatal(err)
+	}
+	replied := make(chan error, 1)
+	go func() {
+		for {
+			m, err := b.Recv()
+			if err != nil {
+				replied <- err
+				return
+			}
+			if p, ok := m.(derp.ReceivedPacket); ok && p.Source == aKey.Public() && IsMeowPacket(p.Data) {
+				if _, _, ok := ParseMeowPing(p.Data); ok {
+					replied <- b.Send(p.Source, EncodeMeowed())
+					return
+				}
+			}
+		}
+	}()
+	c, err := a.Dial(ctx, bKey.Public(), 80)
+	if c != nil {
+		c.Close()
+	}
+	if c != nil || err == nil || ctx.Err() != nil {
+		t.Fatalf("Dial with a header-only meowed reply = %v, %v; want immediate rejection", c, err)
+	}
+	select {
+	case err := <-replied:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-ctx.Done():
+		t.Fatal("legacy peer did not send its reply")
+	}
 }
